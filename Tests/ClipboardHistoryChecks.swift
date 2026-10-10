@@ -1,0 +1,180 @@
+import AppKit
+import ImageIO
+
+/// Uses a private pasteboard; never reads or changes the user's clipboard.
+@main
+struct ClipboardHistoryChecks {
+    @MainActor static func main() {
+        let pb = NSPasteboard.withUniqueName()
+        defer { pb.releaseGlobally() }
+        var checks = 0
+        func check(_ condition: @autoclosure () -> Bool, _ message: String) {
+            guard condition() else { fatalError("FAIL: " + message) }
+            checks += 1
+        }
+        func write(_ text: String) {
+            pb.clearContents()
+            pb.setString(text, forType: .string)
+        }
+        func text(_ entry: ClipboardHistory.Entry?) -> String? {
+            guard let entry, case .text(let value) = entry.content else { return nil }
+            return value
+        }
+        write("Before launch")
+        let history = ClipboardHistory(pasteboard: pb)
+        history.poll()
+        check(history.entries.isEmpty, "existing clipboard is not imported")
+
+        // A copy announces ownership before all representations are ready.
+        // Filling a declared type later does not increment changeCount.
+        let delayed = ClipboardHistory(pasteboard: pb)
+        pb.clearContents()
+        pb.declareTypes([.string], owner: nil)
+        let announcedChange = pb.changeCount
+        delayed.poll()
+        check(delayed.entries.isEmpty, "unfinished copy has no entry yet")
+        pb.setString("Synthetic delayed copy", forType: .string)
+        check(pb.changeCount == announcedChange, "delayed data does not announce another change")
+        delayed.poll()
+        check(text(delayed.entries.first) == "Synthetic delayed copy", "unfinished copy is retried when data arrives")
+
+        delayed.clear()
+        pb.clearContents()
+        let emptyChange = pb.changeCount
+        delayed.poll()
+        pb.setString("Synthetic data after clear", forType: .string)
+        check(pb.changeCount == emptyChange, "supplying data after clear keeps change count")
+        delayed.poll()
+        check(text(delayed.entries.first) == "Synthetic data after clear", "empty ownership announcement is retried")
+
+        delayed.clear()
+        pb.clearContents()
+        pb.declareTypes([.string], owner: nil)
+        delayed.poll()
+        delayed.setTracking(false)
+        pb.setString("Synthetic paused delayed value", forType: .string)
+        delayed.poll()
+        delayed.setTracking(true)
+        delayed.poll()
+        check(delayed.entries.isEmpty, "pause discards an unfinished copy")
+
+        pb.clearContents()
+        pb.declareTypes([.string], owner: nil)
+        for _ in 0..<10 { delayed.poll() }
+        pb.setString("Synthetic expired delayed value", forType: .string)
+        delayed.poll()
+        check(delayed.entries.isEmpty, "unsupported or unavailable data retries are bounded")
+        write("Synthetic fresh copy")
+        delayed.poll()
+        check(text(delayed.entries.first) == "Synthetic fresh copy", "a fresh change resets the retry limit")
+
+        let asynchronous = ClipboardHistory(pasteboard: pb)
+        asynchronous.start()
+        write("Synthetic timer copy")
+        let timerDeadline = Date().addingTimeInterval(1.2)
+        while asynchronous.entries.isEmpty && Date() < timerDeadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+        check(text(asynchronous.entries.first) == "Synthetic timer copy", "running timer observes copies without manual poll")
+        asynchronous.stop()
+        write("After timer stops")
+        RunLoop.main.run(until: Date().addingTimeInterval(0.6))
+        check(asynchronous.entries.isEmpty, "stopped timer stays stopped")
+
+        write("你好，晾绳 👋\nSecond line")
+        history.poll()
+        check(text(history.entries.first) == "你好，晾绳 👋\nSecond line", "Unicode and newlines preserved")
+        history.poll()
+        check(history.entries.count == 1, "unchanged clipboard is not recorded twice")
+        let firstID = history.entries.first!.id
+        write("Second")
+        history.poll()
+        write("你好，晾绳 👋\nSecond line")
+        history.poll()
+        check(history.entries.count == 2 && history.entries.first?.id == firstID, "duplicate moves to front with same identity")
+        let order = history.entries.map(\.id)
+        check(history.copy(history.entries.last!.id), "history copy succeeds")
+        check(pb.string(forType: .string) == "Second", "full text restored")
+        history.poll()
+        check(history.entries.map(\.id) == order, "own copy does not create or reorder entries")
+
+        history.setTracking(false)
+        write("Paused secret")
+        history.poll()
+        write("Another paused secret")
+        history.setTracking(true)
+        history.poll()
+        check(history.entries.count == 2, "paused changes skipped even without a poll")
+        for marker in ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType", "org.nspasteboard.AutoGeneratedType"] {
+            let item = NSPasteboardItem()
+            item.setString("Do not retain", forType: .string)
+            item.setData(Data(), forType: NSPasteboard.PasteboardType(marker))
+            pb.clearContents()
+            pb.writeObjects([item])
+            history.poll()
+            check(history.entries.count == 2, "excluded marker " + marker)
+        }
+        write(" \n\t ")
+        history.poll()
+        check(history.entries.count == 2, "blank contents ignored")
+        write(String(repeating: "x", count: ClipboardHistory.maximumTextBytes + 1))
+        history.poll()
+        check(history.entries.count == 2, "oversized text ignored")
+        pb.clearContents()
+        pb.setData(Data([0, 1, 2]), forType: .png)
+        history.poll()
+        check(history.entries.count == 2, "invalid image ignored")
+
+        let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 4, pixelsHigh: 3,
+                                      bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                      isPlanar: false, colorSpaceName: .deviceRGB,
+                                      bytesPerRow: 0, bitsPerPixel: 0)!
+        let blue = NSColor(calibratedRed: 0.1, green: 0.5, blue: 0.9, alpha: 1)
+        for y in 0..<3 { for x in 0..<4 { bitmap.setColor(blue, atX: x, y: y) } }
+        let png = bitmap.representation(using: .png, properties: [:])!
+        pb.clearContents()
+        pb.setData(png, forType: .png)
+        history.poll()
+        let imageID = history.entries.first!.id
+        check(history.entries.count == 3, "PNG captured")
+        check(history.copy(imageID) && pb.data(forType: .png) == png, "original PNG restored losslessly")
+        history.poll()
+        check(history.entries.count == 3, "image copy not re-recorded")
+        pb.clearContents()
+        pb.setData(bitmap.tiffRepresentation!, forType: .tiff)
+        history.poll()
+        check(history.entries.count == 4, "TIFF converted to PNG")
+        pb.clearContents()
+        pb.setData(bitmap.tiffRepresentation!, forType: .tiff)
+        history.poll()
+        check(history.entries.count == 4, "repeated TIFF deduplicated")
+        let restored = history.entries.first!
+        history.copy(restored.id)
+        let restoredSource = CGImageSourceCreateWithData(pb.data(forType: .png)! as CFData, nil)!
+        let props = CGImageSourceCopyPropertiesAtIndex(restoredSource, 0, nil)! as NSDictionary
+        check(props[kCGImagePropertyPixelWidth] as? Int == 4 && props[kCGImagePropertyPixelHeight] as? Int == 3,
+              "image dimensions preserved")
+
+        for i in 0..<105 { write("Entry \(i)"); history.poll() }
+        check(history.entries.count == 100, "100 item limit enforced")
+        check(text(history.entries.first) == "Entry 104" && text(history.entries.last) == "Entry 5", "oldest entries evicted")
+        let removed = history.entries[20].id
+        history.remove(removed)
+        check(history.entries.count == 99 && !history.entries.contains { $0.id == removed }, "individual deletion")
+        check(!history.copy(removed), "deleted item cannot be copied")
+        history.clear()
+        history.poll()
+        check(history.entries.isEmpty, "clear does not reimport current clipboard")
+        check(ClipboardHistory(pasteboard: pb).entries.isEmpty, "new session starts empty")
+
+        let bounded = ClipboardHistory(pasteboard: pb, byteBudget: 10)
+        bounded.record(.text("123456"), source: "test")
+        bounded.record(.text("abcdef"), source: "test")
+        check(bounded.entries.count == 1 && text(bounded.entries.first) == "abcdef", "memory budget evicts oldest")
+        bounded.record(.text("01234567890"), source: "test")
+        check(bounded.entries.count == 1, "single item exceeding budget rejected")
+        bounded.stop()
+        check(bounded.entries.isEmpty, "shutdown releases retained contents")
+        print("PASS: \(checks) clipboard checks (private pasteboard only)")
+    }
+}

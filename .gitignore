@@ -1,5 +1,13 @@
 .build/
 build/
+output/
+tmp/
 .DS_Store
 *.xcodeproj
 .swiftpm/
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.mobileprovision

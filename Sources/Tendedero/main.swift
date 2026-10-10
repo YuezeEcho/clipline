@@ -7,3 +7,4 @@ MainActor.assumeIsolated {
     app.setActivationPolicy(.accessory)
     withExtendedLifetime(delegate) { app.run() }
 }
+

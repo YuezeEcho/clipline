@@ -9,7 +9,7 @@ import SwiftUI
 /// - The Trash discards it.
 /// - Nowhere that accepts it: the photo flies back to the line.
 ///
-/// Click copies, press and hold opens Markup, the corner cross discards.
+/// Click copies, press and hold opens the image, the corner cross discards.
 struct GrabArea: NSViewRepresentable {
     let item: Pegged
     let line: Line
@@ -23,16 +23,27 @@ struct GrabArea: NSViewRepresentable {
     func updateNSView(_ view: GrabView, context: Context) {
         configure(view)
     }
+    static func dismantleNSView(_ view: GrabView, coordinator: ()) { view.cancelPress() }
 
     private func configure(_ view: GrabView) {
         let id = item.id
         let line = line
-        let isRecording = item.isRecording
         view.url = item.url
         view.dragImage = item.thumb
+        view.onHover = { hovered in
+            if item.isVideo && hovered && line.revealed && line.section == .screenshots
+                && !item.flying && !item.falling && line.pressedID == nil && !GrabView.isDragging {
+                line.videoPreview.start(id, url: item.url)
+            } else {
+                line.videoPreview.stop(id)
+            }
+        }
         view.onClick = { line.copy(id) }
         view.onDoubleClick = { line.open(id) }
-        view.onDragStart = { line.draggingID = id }
+        view.doubleClickShowsMenu = true
+        view.onMenuWillOpen = { line.videoPreview.stop(); line.beginInteraction() }
+        view.onMenuDidClose = { line.endInteraction() }
+        view.onDragStart = { line.videoPreview.stop(); line.draggingID = id }
         view.onDragEnd = {
             line.draggingID = nil
             // Moved into a folder: it is saved where you wanted it.
@@ -40,37 +51,43 @@ struct GrabArea: NSViewRepresentable {
         }
         view.onTrash = { line.trash(id) }
         view.onDiscard = { line.discard(id) }
-        view.onLongPress = { line.markup(id) }
-        view.onForceClick = { line.quickLook(id) }
+        view.onLongPress = { line.open(id) }
         view.onPressChange = { pressed in line.pressedID = pressed ? id : nil }
         view.menuProvider = {
             let menu = NSMenu()
-            // Items say themselves whether they can be used.
             menu.autoenablesItems = false
-            menu.addItem(ClosureMenuItem(L("Copy")) { line.copy(id) })
-            menu.addItem(ClosureMenuItem(L("Open")) { line.open(id) })
-            menu.addItem(ClosureMenuItem(L("Quick Look")) { line.quickLook(id) })
-            if !isRecording {
-                menu.addItem(ClosureMenuItem(L("Markup")) { line.markup(id) })
+            menu.addItem(ClosureMenuItem(L("Copy", "Copiar")) { line.copy(id) })
+            menu.addItem(ClosureMenuItem(item.isVideo ? L("Open", "Abrir") : C("Edit image", "编辑图片", "編輯圖片")) { line.open(id) })
+            if !item.isVideo {
+                menu.addItem(ClosureMenuItem(L("Open", "Abrir")) { line.openInSystemEditor(id) })
             }
-            menu.addItem(ClosureMenuItem(L("Show in Finder")) { line.reveal(id) })
+            menu.addItem(ClosureMenuItem(L("Show in Finder", "Mostrar en Finder")) { line.reveal(id) })
             let inInbox = line.isInInbox(id)
             if inInbox {
-                menu.addItem(ClosureMenuItem(L("Save to Desktop")) { line.saveToDesktop(id) })
+                menu.addItem(ClosureMenuItem(L("Save to Desktop", "Guardar en el Escritorio")) { line.saveToDesktop(id) })
             }
             menu.addItem(.separator())
-            if inInbox {
-                menu.addItem(ClosureMenuItem(L("Discard")) { line.discard(id) })
-            } else {
-                menu.addItem(ClosureMenuItem(L("Take down")) { line.discard(id) })
-                menu.addItem(ClosureMenuItem(L("Move to Trash")) { line.trash(id) })
+            let pin = NSMenuItem(title: C("Pin an image here", "在此位置固定图片"), action: nil, keyEquivalent: "")
+            let choices = NSMenu()
+            choices.autoenablesItems = false
+            let width = line.interactionRect.width
+            let x = (line.cardLayoutRects[id] ?? line.hitRects[id])?.midX
+            let choose = ClosureMenuItem(C("Choose image…", "选择图片…")) {
+                if let x { line.onRequestPin?(x, width) }
             }
-            let left = ClosureMenuItem(L("Take down everything to the left")) { line.takeDown(id, toTheLeft: true) }
-            left.isEnabled = !line.neighbours(of: id, toTheLeft: true).isEmpty
-            menu.addItem(left)
-            let right = ClosureMenuItem(L("Take down everything to the right")) { line.takeDown(id, toTheLeft: false) }
-            right.isEnabled = !line.neighbours(of: id, toTheLeft: false).isEmpty
-            menu.addItem(right)
+            choose.isEnabled = x != nil && (line.canPinPhoto?(width) ?? false)
+            choices.addItem(choose)
+            if !choose.isEnabled {
+                let full = NSMenuItem(title: C("This screen's pin limit is reached", "已达到当前屏幕的固定数量上限"),
+                                      action: nil, keyEquivalent: "")
+                full.isEnabled = false
+                choices.addItem(full)
+            }
+            pin.submenu = choices
+            menu.addItem(pin)
+            menu.addItem(.separator())
+            menu.addItem(ClosureMenuItem(L("Take down", "Descolgar")) { line.drop(id) })
+            menu.addItem(ClosureMenuItem(L("Move to Trash", "Mover a la Papelera")) { line.trash(id) })
             return menu
         }
     }
@@ -78,19 +95,21 @@ struct GrabArea: NSViewRepresentable {
 
 final class GrabView: NSView, NSDraggingSource {
     static var isDragging = false
-    /// A photo's menu is open. It reaches past the line, so the line waits.
-    static var isShowingMenu = false
 
     var url: URL?
     var dragImage: NSImage?
+    var onHover: (Bool) -> Void = { _ in }
+    private var hoverTracking: NSTrackingArea?
     var onClick: () -> Void = {}
     var onDoubleClick: () -> Void = {}
+    var doubleClickShowsMenu = false
+    var onMenuWillOpen: () -> Void = {}
+    var onMenuDidClose: () -> Void = {}
     var onDragStart: () -> Void = {}
     var onDragEnd: () -> Void = {}
     var onTrash: () -> Void = {}
     var onDiscard: () -> Void = {}
     var onLongPress: () -> Void = {}
-    var onForceClick: () -> Void = {}
     var onPressChange: (Bool) -> Void = { _ in }
     var menuProvider: () -> NSMenu = { NSMenu() }
 
@@ -99,9 +118,21 @@ final class GrabView: NSView, NSDraggingSource {
     private var holdTimer: Timer?
     private var didLongPress = false
 
-    /// How long you hold before Markup opens. Long enough not to fire on a
+    /// How long you hold before the image opens. Long enough not to fire on a
     /// slow click, short enough to feel deliberate.
     private static let holdDuration: TimeInterval = 0.45
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTracking { removeTrackingArea(hoverTracking) }
+        let tracking = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                      owner: self, userInfo: nil)
+        addTrackingArea(tracking)
+        hoverTracking = tracking
+    }
+
+    override func mouseEntered(with event: NSEvent) { onHover(true) }
+    override func mouseExited(with event: NSEvent) { onHover(false) }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
@@ -123,8 +154,9 @@ final class GrabView: NSView, NSDraggingSource {
             return
         }
         if event.clickCount == 2 {
+            endPress()
             downPoint = nil
-            onDoubleClick()
+            if doubleClickShowsMenu { showMenu(with: event) } else { onDoubleClick() }
             return
         }
         downPoint = event.locationInWindow
@@ -142,19 +174,16 @@ final class GrabView: NSView, NSDraggingSource {
         }
     }
 
-    /// A force click on a trackpad opens Quick Look, as it does in Finder.
-    /// It counts instead of the click and of a long press.
-    override func pressureChange(with event: NSEvent) {
-        guard event.stage == 2, downPoint != nil, !startedDrag, !didLongPress else { return }
-        didLongPress = true
-        endPress()
-        onForceClick()
-    }
-
     private func endPress() {
         holdTimer?.invalidate()
         holdTimer = nil
         onPressChange(false)
+    }
+
+    func cancelPress() {
+        endPress()
+        downPoint = nil
+        didLongPress = false
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -181,10 +210,15 @@ final class GrabView: NSView, NSDraggingSource {
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        // The menu runs until it closes, and the line stays down meanwhile.
-        GrabView.isShowingMenu = true
+        showMenu(with: event)
+    }
+
+    private func showMenu(with event: NSEvent) {
+        endPress()
+        downPoint = nil
+        onMenuWillOpen()
+        defer { onMenuDidClose() }
         NSMenu.popUpContextMenu(menuProvider(), with: event, for: self)
-        GrabView.isShowingMenu = false
     }
 
     // MARK: NSDraggingSource

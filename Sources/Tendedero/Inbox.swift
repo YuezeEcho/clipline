@@ -1,43 +1,127 @@
 import Foundation
 
-/// Inbox mode: Tendedero takes over where screenshots go.
-///
-/// It changes the macOS screenshot settings in the Options menu of
-/// Cmd+Shift+5: the floating thumbnail is turned off, so the file is written
-/// at once instead of five seconds later, and captures are saved as files in
-/// Tendedero's own folder, so the Desktop only gets what you keep. Saving to
-/// the clipboard or Preview would leave nothing to hang, and a click on the
-/// line copies anyway.
-/// Screen recordings go there too, and hang on the line like screenshots.
-///
-/// The previous values are saved first and put back when the mode is turned
-/// off or the app quits, so macOS is never left pointing at a folder nobody
-/// is watching.
+/// Instant capture disables macOS's floating thumbnail. Save locations stay
+/// under the user's control and are followed by the capture library.
 enum Inbox {
     private static let domain = "com.apple.screencapture" as CFString
-    /// macOS 26 and earlier read "location". macOS 27 reads
-    /// "location-screenshot" and ignores the old key, so both are written.
+    // Support both the shared preference and capture-specific preferences.
     private static let locationKey = "location" as CFString
     private static let screenshotLocationKey = "location-screenshot" as CFString
-    /// macOS 27 keeps screen recordings apart, in "location-screenrecording".
-    /// Earlier versions send them wherever "location" points.
-    private static let recordingLocationKey = "location-screenrecording" as CFString
+    private static let recordingLocationKey = "location-video" as CFString
+    static let usesSeparateLocations = ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27
     private static let thumbnailKey = "show-thumbnail" as CFString
-    /// Whether a capture is saved as a file or sent to the clipboard, Preview
-    /// and so on. macOS 26 and earlier read "target"; macOS 27 has one for
-    /// screenshots and one for recordings.
-    private static let targetKey = "target" as CFString
-    private static let screenshotTargetKey = "target-screenshot" as CFString
-    private static let recordingTargetKey = "target-screenrecording" as CFString
 
     private static let enabledKey = "inboxEnabled"
     private static let offeredKey = "inboxOffered"
     private static let savedKey = "inboxSavedSettings"
 
     static let folder: URL = {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        return base.appendingPathComponent("Tendedero/Screenshots", isDirectory: true)
+        let base = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent("Clipline Screenshots", isDirectory: true)
     }()
+
+    /// Existing captures keep their original URLs. Recognize this location
+    /// when upgrading so it never becomes the user's restored save location.
+    static let legacyFolder: URL = {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return base.appendingPathComponent("Clipline/Screenshots", isDirectory: true)
+    }()
+
+    static func contains(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        return [folder, legacyFolder].contains {
+            path.hasPrefix($0.standardizedFileURL.path + "/")
+        }
+    }
+
+    struct Settings: Equatable {
+        var location: String?
+        var screenshotLocation: String?
+        var recordingLocation: String?
+        var showsThumbnail: Bool?
+
+        init(location: String? = nil, screenshotLocation: String? = nil,
+             recordingLocation: String? = nil, showsThumbnail: Bool? = nil) {
+            self.location = location
+            self.screenshotLocation = screenshotLocation
+            self.recordingLocation = recordingLocation
+            self.showsThumbnail = showsThumbnail
+        }
+
+        init(dictionary: [String: Any]) {
+            location = dictionary["location"] as? String
+            screenshotLocation = dictionary["locationScreenshot"] as? String
+            recordingLocation = dictionary["locationVideo"] as? String
+            showsThumbnail = dictionary["thumbnail"] as? Bool
+        }
+
+        var dictionary: [String: Any] {
+            var values: [String: Any] = [:]
+            if let location { values["location"] = location }
+            if let screenshotLocation { values["locationScreenshot"] = screenshotLocation }
+            if let recordingLocation { values["locationVideo"] = recordingLocation }
+            if let showsThumbnail { values["thumbnail"] = showsThumbnail }
+            return values
+        }
+
+        var hasOwnedLocation: Bool {
+            Inbox.ownsLocation(location) || Inbox.ownsLocation(screenshotLocation)
+                || Inbox.ownsLocation(recordingLocation)
+        }
+
+        func locations(separate: Bool) -> CaptureLocations {
+            CaptureLocations(screenshots: separate ? (screenshotLocation ?? location) : location,
+                             recordings: separate ? (recordingLocation ?? location) : location)
+        }
+
+        var locations: CaptureLocations { locations(separate: Inbox.usesSeparateLocations) }
+    }
+
+    enum CaptureState: Equatable { case off, ready, folderUnavailable, thumbnailEnabled }
+
+    static func captureState(enabled: Bool, settings: Settings) -> CaptureState {
+        guard enabled else { return .off }
+        return settings.showsThumbnail == false ? .ready : .thumbnailEnabled
+    }
+
+    static var captureState: CaptureState {
+        let current = currentSettings()
+        let state = captureState(enabled: isEnabled, settings: current)
+        if isEnabled && !current.locations.folders.allSatisfy({ FileManager.default.isReadableFile(atPath: $0.path) }) {
+            return .folderUnavailable
+        }
+        return state
+    }
+
+    static var locations: CaptureLocations { currentSettings().locations }
+
+    static func ownsLocation(_ path: String?) -> Bool {
+        guard let path, !path.isEmpty else { return false }
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
+        return [folder, legacyFolder].contains { $0.standardizedFileURL.path == url.path }
+    }
+
+    /// Pure planning functions also let regression checks cover crash recovery
+    /// and upgrades without changing macOS screenshot preferences.
+    static func settingsToSave(current: Settings, existingBackup: Settings?) -> Settings {
+        guard current.hasOwnedLocation else { return current }
+        if let existingBackup { return existingBackup }
+        // An old instance may have exited without leaving a backup. Restore
+        // system defaults for our values and preserve any independent setting.
+        return Settings(location: ownsLocation(current.location) ? nil : current.location,
+                        screenshotLocation: ownsLocation(current.screenshotLocation) ? nil : current.screenshotLocation,
+                        recordingLocation: ownsLocation(current.recordingLocation) ? nil : current.recordingLocation,
+                        showsThumbnail: current.showsThumbnail == false ? nil : current.showsThumbnail)
+    }
+
+    static func settingsToRestore(current: Settings, saved: Settings, restoreLocations: Bool = true) -> Settings? {
+        guard current.hasOwnedLocation || current.showsThumbnail == false else { return nil }
+        // If the user changes a save location while Clipline runs, keep it.
+        return Settings(location: restoreLocations && ownsLocation(current.location) ? saved.location : current.location,
+                        screenshotLocation: restoreLocations && ownsLocation(current.screenshotLocation) ? saved.screenshotLocation : current.screenshotLocation,
+                        recordingLocation: restoreLocations && ownsLocation(current.recordingLocation) ? saved.recordingLocation : current.recordingLocation,
+                        showsThumbnail: current.showsThumbnail == false ? saved.showsThumbnail : current.showsThumbnail)
+    }
 
     /// The user's choice, kept across launches.
     static var isEnabled: Bool {
@@ -51,57 +135,73 @@ enum Inbox {
         set { UserDefaults.standard.set(newValue, forKey: offeredKey) }
     }
 
-    /// Whether macOS is currently sending screenshots to our folder.
+    /// Whether instant capture is configured and the selected folders are readable.
     static var isApplied: Bool {
-        guard let current = CFPreferencesCopyAppValue(locationKey, domain) as? String else { return false }
-        return URL(fileURLWithPath: (current as NSString).expandingTildeInPath).standardizedFileURL
-            == folder.standardizedFileURL
+        captureState == .ready
     }
 
-    static func apply() {
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    @discardableResult
+    static func apply(resetLocation: Bool = false) -> Bool {
+        if resetLocation {
+            do {
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            } catch {
+                NSLog("Clipline: cannot create screenshot folder: %@", error.localizedDescription)
+                return false
+            }
+        }
         // Never save our own values as the "previous" ones, for example after
-        // a crash left them applied.
-        var saved = UserDefaults.standard.dictionary(forKey: savedKey) ?? [:]
-        if !isApplied {
-            saved = [:]
-            saved["location"] = CFPreferencesCopyAppValue(locationKey, domain) as? String
-            saved["locationScreenshot"] = CFPreferencesCopyAppValue(screenshotLocationKey, domain) as? String
-            saved["thumbnail"] = CFPreferencesCopyAppValue(thumbnailKey, domain) as? Bool
+        // a crash left them applied, or the previous version used Library.
+        let dictionary = UserDefaults.standard.dictionary(forKey: savedKey)
+        let backup = dictionary.map(Settings.init(dictionary:))
+        let current = currentSettings()
+        let saved = backup ?? settingsToSave(current: current, existingBackup: nil)
+        var values = saved.dictionary
+        // Older versions changed the directory; this version normally changes
+        // only the thumbnail. A user's own choice must survive quitting.
+        values["changedLocation"] = resetLocation || (dictionary?["changedLocation"] as? Bool
+            ?? (dictionary != nil && current.hasOwnedLocation))
+        UserDefaults.standard.set(values, forKey: savedKey)
+        if resetLocation {
+            set(locationKey, folder.path)
+            set(screenshotLocationKey, usesSeparateLocations ? folder.path : nil)
+            set(recordingLocationKey, usesSeparateLocations ? folder.path : nil)
         }
-        // Recordings and the target came later: settings saved by an earlier
-        // version lack them, and the value macOS has now is still the user's own.
-        if saved["recordingSaved"] == nil {
-            saved["locationRecording"] = CFPreferencesCopyAppValue(recordingLocationKey, domain) as? String
-            saved["recordingSaved"] = true
-        }
-        if saved["targetSaved"] == nil {
-            saved["target"] = CFPreferencesCopyAppValue(targetKey, domain) as? String
-            saved["targetScreenshot"] = CFPreferencesCopyAppValue(screenshotTargetKey, domain) as? String
-            saved["targetRecording"] = CFPreferencesCopyAppValue(recordingTargetKey, domain) as? String
-            saved["targetSaved"] = true
-        }
-        UserDefaults.standard.set(saved, forKey: savedKey)
-        set(locationKey, folder.path)
-        set(screenshotLocationKey, folder.path)
-        set(recordingLocationKey, folder.path)
-        set(targetKey, "file")
-        set(screenshotTargetKey, "file")
-        set(recordingTargetKey, "file")
+        set(thumbnailKey, false)
+        return isApplied
+    }
+
+    /// Keep instant capture instant if the system's thumbnail option is changed.
+    /// Custom screenshot and recording locations are never changed back.
+    static func maintainInstantCapture() {
+        guard isEnabled else { return }
+        let current = currentSettings()
+        guard shouldDisableThumbnail(enabled: true, settings: current) else { return }
         set(thumbnailKey, false)
     }
 
+    static func shouldDisableThumbnail(enabled: Bool, settings: Settings) -> Bool {
+        enabled && settings.showsThumbnail != false
+    }
+
     static func restore() {
-        guard isApplied else { return }
-        let saved = UserDefaults.standard.dictionary(forKey: savedKey) ?? [:]
-        set(locationKey, saved["location"])
-        set(screenshotLocationKey, saved["locationScreenshot"])
-        set(recordingLocationKey, saved["locationRecording"])
-        set(targetKey, saved["target"])
-        set(screenshotTargetKey, saved["targetScreenshot"])
-        set(recordingTargetKey, saved["targetRecording"])
-        set(thumbnailKey, saved["thumbnail"])
-        UserDefaults.standard.removeObject(forKey: savedKey)
+        guard let dictionary = UserDefaults.standard.dictionary(forKey: savedKey) else { return }
+        let saved = Settings(dictionary: dictionary)
+        defer { UserDefaults.standard.removeObject(forKey: savedKey) }
+        guard let restored = settingsToRestore(current: currentSettings(), saved: saved,
+                                               restoreLocations: dictionary["changedLocation"] as? Bool ?? true) else { return }
+        set(locationKey, restored.location)
+        set(screenshotLocationKey, restored.screenshotLocation)
+        set(recordingLocationKey, restored.recordingLocation)
+        set(thumbnailKey, restored.showsThumbnail)
+    }
+
+    private static func currentSettings() -> Settings {
+        CFPreferencesAppSynchronize(domain)
+        return Settings(location: CFPreferencesCopyAppValue(locationKey, domain) as? String,
+                        screenshotLocation: CFPreferencesCopyAppValue(screenshotLocationKey, domain) as? String,
+                        recordingLocation: CFPreferencesCopyAppValue(recordingLocationKey, domain) as? String,
+                        showsThumbnail: CFPreferencesCopyAppValue(thumbnailKey, domain) as? Bool)
     }
 
     /// Writes through cfprefsd, so the screenshot service sees it at once.
